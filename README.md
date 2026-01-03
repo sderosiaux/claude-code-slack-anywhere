@@ -49,6 +49,8 @@ Ever wanted to:
 - **Reaction Status** - Visual feedback: 👀 (processing) → ✅ (done)
 - **Multi-Session** - Run multiple concurrent sessions, each with its own Slack channel
 - **Interactive Buttons** - Answer Claude's questions with Block Kit buttons
+- **Auto-Session Detection** - Send a message in any channel matching a project folder → auto-starts
+- **Image Support** - Drop images in Slack to send them to Claude for analysis
 - **tmux Integration** - Sessions persist in tmux
 
 ## Demo Workflow
@@ -146,6 +148,29 @@ Type these in any channel where the bot is present:
 
 > **Note:** Use double-slash `//` for Claude slash commands. Single `/` is intercepted by Slack.
 
+### Auto-Session Detection
+
+No need to use `!new` if a project folder already exists. Just send a message in a Slack channel that matches a folder name in your `projects_dir`:
+
+```
+Slack channel: #my-cool-project
+Project folder: ~/Desktop/ai-projects/my-cool-project  (or "my cool project")
+→ Auto-detected! Session starts automatically.
+```
+
+The bot handles hyphen/space conversion (Slack uses hyphens, folders may use spaces).
+
+### Image Support
+
+Drop images directly in Slack messages. They're downloaded and passed to Claude for analysis:
+
+```
+You: [attaches screenshot.png] "What's wrong with this error?"
+→ Claude analyzes the image and responds
+```
+
+Supported formats: PNG, JPG, GIF, WebP
+
 ### Reaction Status
 
 When you send a message in a session channel:
@@ -203,35 +228,26 @@ The only external communication is:
 
 ## Running as a Service (macOS)
 
-Create `~/Library/LaunchAgents/com.ccsa.plist`:
+```bash
+# Install the plist (auto-configures paths)
+sed -e "s|__BINARY_PATH__|$HOME/bin/claude-code-slack-anywhere|g" \
+    -e "s|__HOME__|$HOME|g" \
+    com.ccsa.plist > ~/Library/LaunchAgents/com.ccsa.plist
 
-```xml
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key>
-    <string>com.ccsa</string>
-    <key>ProgramArguments</key>
-    <array>
-        <string>/Users/YOUR_USERNAME/bin/claude-code-slack-anywhere</string>
-        <string>listen</string>
-    </array>
-    <key>RunAtLoad</key>
-    <true/>
-    <key>KeepAlive</key>
-    <true/>
-    <key>StandardOutPath</key>
-    <string>/Users/YOUR_USERNAME/.ccsa.log</string>
-    <key>StandardErrorPath</key>
-    <string>/Users/YOUR_USERNAME/.ccsa.log</string>
-</dict>
-</plist>
+# Start the service
+launchctl load ~/Library/LaunchAgents/com.ccsa.plist
 ```
 
-Then:
+**Useful commands:**
 ```bash
-launchctl load ~/Library/LaunchAgents/com.ccsa.plist
+# View logs
+tail -f ~/.ccsa.log
+
+# Restart
+launchctl kickstart -k gui/$(id -u)/com.ccsa
+
+# Stop
+launchctl unload ~/Library/LaunchAgents/com.ccsa.plist
 ```
 
 ## Contributing
