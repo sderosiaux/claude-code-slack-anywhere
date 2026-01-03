@@ -241,7 +241,3 @@ Contributions welcome! See [TODO.md](TODO.md) for planned features.
 ## License
 
 [MIT License](LICENSE)
-
----
-
-Made with Claude Code
