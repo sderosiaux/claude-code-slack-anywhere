@@ -1,4 +1,4 @@
-module github.com/kidandcat/ccc
+module github.com/sderosiaux/claude-slack-relay-anywhere
 
 go 1.21
 

@@ -1723,7 +1723,7 @@ FLAGS:
     -h, --help              Show this help
     -v, --version           Show version
 
-For more info: https://github.com/kidandcat/ccc
+For more info: https://github.com/sderosiaux/claude-slack-relay-anywhere
 `, version)
 }
 

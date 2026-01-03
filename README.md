@@ -59,8 +59,8 @@ Slack (phone/desktop)           PC (Terminal)
 ### From Source
 
 ```bash
-git clone https://github.com/kidandcat/ccc.git
-cd ccc
+git clone https://github.com/sderosiaux/claude-slack-relay-anywhere.git
+cd claude-slack-relay-anywhere
 go mod tidy
 make install
 ```
