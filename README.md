@@ -56,20 +56,17 @@ Ever wanted to:
 ```
 Slack (phone/desktop)
 ─────────────────────────────────────
-1. !new myproject
-   → Creates #myproject channel + Claude session
+1. !new todo-app
+   → Creates #todo-app channel + Claude session
 
-2. "Fix the auth bug"
+2. "Build a REST API with user auth"
    → 👀 reaction appears on your message
    → Claude's response streams to thread
+   → ✅ when done
 
-3. Response complete
-   → ✅ reaction replaces 👀
-   → Full output visible in thread
-
-4. Continue chatting in the channel
-   → Each message goes to Claude
-   → Responses stream back
+3. "Add unit tests"
+   → Claude continues in the same session
+   → Full context preserved
 ```
 
 ## Requirements
