@@ -55,6 +55,13 @@ flowchart LR
    └─ ✅
 ```
 
+## Why Slack?
+
+- **Familiar UX** - No new app to learn, works on phone/desktop
+- **Shareable** - Invite teammates to project channels (if you trust them!)
+- **Rich formatting** - Code blocks, threads, reactions, file uploads
+- **Free tier** - Works with Slack's free plan
+
 ## Features
 
 | Feature | Description |
@@ -64,7 +71,6 @@ flowchart LR
 | **Visual Status** | 👀 processing → ✅ done (or ❌ error) |
 | **Images** | Drop screenshots in Slack for Claude to analyze |
 | **Interactive** | Answer Claude's questions via buttons |
-| **Self-Hosted** | Runs on your machine, your code never leaves |
 
 ## Requirements
 
@@ -195,29 +201,23 @@ Config is stored in `~/.ccsa.json`:
 | `user_id` | Your Slack member ID (for authorization) |
 | `projects_dir` | Base directory for projects (default: `~/Desktop/ai-projects`) |
 
-## Privacy & Security
+## Security
 
-### Privacy
+**What goes where:**
+- Your **code files** stay on your machine (Claude Code runs locally)
+- Your **prompts and responses** go through Slack's servers
+- Claude API calls go to Anthropic (handled by Claude Code)
 
-**This tool runs 100% on your machine.** There are no external servers, no analytics, no data collection.
+**Safeguards:**
+- Bot only responds to configured `user_id`
+- Config stored with `0600` permissions
+- Socket Mode (no public webhook URL)
+- Open source - audit it yourself
 
-- Your code stays on your computer
-- Claude Code runs locally via Anthropic's official CLI
-- Only messages you explicitly send go through Slack
-- No telemetry, no tracking, no cloud dependencies
-
-The only external communication is:
-1. **Slack API** - For sending/receiving your messages (your workspace, your control)
-2. **Anthropic API** - Claude Code's own connection (handled by Claude Code itself)
-
-### Security
-
-- **Authorization**: Bot only accepts messages from the configured `user_id`
-- **Config permissions**: `~/.ccsa.json` is created with `0600` (owner-only)
-- **Socket Mode**: No public URL needed, connection initiated from your machine
-- **Open source**: Full code transparency, audit it yourself
-
-> Note: Uses `--dangerously-skip-permissions` for automation - understand the implications
+**Heads up:**
+- Uses `--dangerously-skip-permissions` for automation
+- `!c <cmd>` executes shell commands - disable if you don't need it
+- Anyone with access to your Slack workspace channels can see conversations
 
 ## Running as a Service (macOS)
 
