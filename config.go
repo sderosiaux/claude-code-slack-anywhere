@@ -12,9 +12,22 @@ import (
 type Config struct {
 	BotToken    string            `json:"bot_token"`              // Slack Bot Token (xoxb-...)
 	AppToken    string            `json:"app_token"`              // Slack App Token (xapp-...) for Socket Mode
-	UserID      string            `json:"user_id"`                // Authorized Slack user ID
+	UserID      string            `json:"user_id,omitempty"`      // Authorized Slack user ID (deprecated, use user_ids)
+	UserIDs     []string          `json:"user_ids,omitempty"`     // Authorized Slack user IDs
 	Sessions    map[string]string `json:"sessions"`               // session name -> channel ID
-	ProjectsDir string            `json:"projects_dir,omitempty"` // Base directory for projects (default: ~/Desktop/ai-projects)
+	ProjectsDir string            `json:"projects_dir,omitempty"` // Base directory for projects
+}
+
+// IsAuthorizedUser checks if a user ID is in the authorized list
+func (c *Config) IsAuthorizedUser(userID string) bool {
+	// Check new UserIDs list
+	for _, id := range c.UserIDs {
+		if id == userID {
+			return true
+		}
+	}
+	// Fallback to old single UserID for backward compat
+	return c.UserID != "" && c.UserID == userID
 }
 
 // ConfigManager provides thread-safe access to Config
@@ -24,9 +37,13 @@ type ConfigManager struct {
 	path   string
 }
 
-func NewConfigManager() *ConfigManager {
+func NewConfigManager(configPath string) *ConfigManager {
+	path := configPath
+	if path == "" {
+		path = getConfigPath()
+	}
 	return &ConfigManager{
-		path: getConfigPath(),
+		path: path,
 	}
 }
 
@@ -147,18 +164,18 @@ func saveConfig(config *Config) error {
 	return os.WriteFile(getConfigPath(), data, 0600)
 }
 
-// getProjectsDir returns the base directory for projects from config or default
+// getProjectsDir returns the base directory for projects from config
+// Returns empty string if not configured (mandatory field)
 func getProjectsDir(config *Config) string {
-	if config != nil && config.ProjectsDir != "" {
-		// Expand ~ if present
-		if len(config.ProjectsDir) > 2 && config.ProjectsDir[:2] == "~/" {
-			home, _ := os.UserHomeDir()
-			return filepath.Join(home, config.ProjectsDir[2:])
-		}
-		return config.ProjectsDir
+	if config == nil || config.ProjectsDir == "" {
+		return ""
 	}
-	home, _ := os.UserHomeDir()
-	return filepath.Join(home, "Desktop", "ai-projects")
+	// Expand ~ if present
+	if len(config.ProjectsDir) > 2 && config.ProjectsDir[:2] == "~/" {
+		home, _ := os.UserHomeDir()
+		return filepath.Join(home, config.ProjectsDir[2:])
+	}
+	return config.ProjectsDir
 }
 
 // getSessionByChannel returns session name for a channel (used in tests)

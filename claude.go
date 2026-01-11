@@ -35,7 +35,7 @@ type HookData struct {
 	} `json:"tool_input"`
 }
 
-// ClaudeResponse represents the JSON response from claude -p --output-format json
+// ClaudeResponse represents the final response from Claude
 type ClaudeResponse struct {
 	Result    string `json:"result"`
 	SessionID string `json:"session_id"`
@@ -47,11 +47,98 @@ type ClaudeResponse struct {
 	} `json:"usage"`
 	DurationMs int  `json:"duration_ms"`
 	IsError    bool `json:"is_error"`
+	NumTurns   int  `json:"num_turns"`
+}
+
+// ============================================================================
+// Claude Code stream-json Event Types (inspired by vibe-kanban)
+// ============================================================================
+
+// StreamEvent represents any JSON event from Claude's stream-json output
+type StreamEvent struct {
+	Type      string          `json:"type"`
+	Subtype   string          `json:"subtype,omitempty"`
+	SessionID string          `json:"session_id,omitempty"`
+	Message   *ClaudeMessage  `json:"message,omitempty"`
+	Result    json.RawMessage `json:"result,omitempty"`
+	IsError   bool            `json:"is_error,omitempty"`
+	Error     string          `json:"error,omitempty"`
+	Usage     *ClaudeUsage    `json:"usage,omitempty"`
+	DurationMs int            `json:"duration_ms,omitempty"`
+	NumTurns  int             `json:"num_turns,omitempty"`
+	// For tool_use events
+	ToolName  string          `json:"tool_name,omitempty"`
+	ToolInput json.RawMessage `json:"input,omitempty"`
+	// For system events
+	Cwd   string   `json:"cwd,omitempty"`
+	Model string   `json:"model,omitempty"`
+	Tools []string `json:"tools,omitempty"`
+}
+
+// ClaudeMessage represents an assistant or user message
+type ClaudeMessage struct {
+	ID         string              `json:"id,omitempty"`
+	Type       string              `json:"type,omitempty"`
+	Role       string              `json:"role"`
+	Model      string              `json:"model,omitempty"`
+	Content    []ClaudeContentItem `json:"content"`
+	StopReason string              `json:"stop_reason,omitempty"`
+}
+
+// ClaudeContentItem represents a content block (text, thinking, tool_use, tool_result)
+type ClaudeContentItem struct {
+	Type      string          `json:"type"`
+	Text      string          `json:"text,omitempty"`
+	Thinking  string          `json:"thinking,omitempty"`
+	ID        string          `json:"id,omitempty"`
+	Name      string          `json:"name,omitempty"`
+	Input     json.RawMessage `json:"input,omitempty"`
+	ToolUseID string          `json:"tool_use_id,omitempty"`
+	Content   json.RawMessage `json:"content,omitempty"`
+	IsError   bool            `json:"is_error,omitempty"`
+}
+
+// ClaudeUsage represents token usage
+type ClaudeUsage struct {
+	InputTokens              int `json:"input_tokens,omitempty"`
+	OutputTokens             int `json:"output_tokens,omitempty"`
+	CacheCreationInputTokens int `json:"cache_creation_input_tokens,omitempty"`
+	CacheReadInputTokens     int `json:"cache_read_input_tokens,omitempty"`
 }
 
 // claudeSessionIDs stores Claude session IDs by Slack channel ID
-// This allows conversation continuity across messages
 var claudeSessionIDs sync.Map // channelID (string) -> sessionID (string)
+
+const sessionFilePath = "/tmp/claude-slack-sessions.json"
+
+// loadSessionsFromDisk loads persisted sessions from disk
+func loadSessionsFromDisk() {
+	data, err := os.ReadFile(sessionFilePath)
+	if err != nil {
+		return // File doesn't exist yet, that's fine
+	}
+	var sessions map[string]string
+	if err := json.Unmarshal(data, &sessions); err != nil {
+		return
+	}
+	for k, v := range sessions {
+		claudeSessionIDs.Store(k, v)
+	}
+}
+
+// saveSessionsToDisk persists sessions to disk
+func saveSessionsToDisk() {
+	sessions := make(map[string]string)
+	claudeSessionIDs.Range(func(key, value interface{}) bool {
+		sessions[key.(string)] = value.(string)
+		return true
+	})
+	data, err := json.Marshal(sessions)
+	if err != nil {
+		return
+	}
+	os.WriteFile(sessionFilePath, data, 0600)
+}
 
 // Paths for binaries
 var (
@@ -60,19 +147,16 @@ var (
 )
 
 func init() {
-	// Find our own binary path
 	if exe, err := os.Executable(); err == nil {
 		binPath = exe
 	}
 
-	// Find claude binary
 	home, _ := os.UserHomeDir()
 	claudePaths := []string{
 		filepath.Join(home, ".claude", "local", "claude"),
 		"/usr/local/bin/claude",
 	}
 
-	// Add NVM node paths (claude installed via npm)
 	nvmDir := filepath.Join(home, ".nvm", "versions", "node")
 	if entries, err := os.ReadDir(nvmDir); err == nil {
 		for _, entry := range entries {
@@ -89,12 +173,14 @@ func init() {
 		}
 	}
 
-	// Fallback: find claude in PATH
 	if claudePath == "" {
 		if p, err := exec.LookPath("claude"); err == nil {
 			claudePath = p
 		}
 	}
+
+	// Load persisted sessions
+	loadSessionsFromDisk()
 }
 
 func runClaudeRaw(continueSession bool) error {
@@ -169,7 +255,6 @@ func runClaude(prompt string) (string, error) {
 }
 
 // callClaudeJSON calls Claude in headless mode with JSON output
-// It automatically resumes the session if one exists for the channel
 func callClaudeJSON(prompt string, channelID string, workDir string) (*ClaudeResponse, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancel()
@@ -184,7 +269,6 @@ func callClaudeJSON(prompt string, channelID string, workDir string) (*ClaudeRes
 		"--output-format", "json",
 	}
 
-	// Resume session if one exists for this channel
 	if sid, ok := claudeSessionIDs.Load(channelID); ok {
 		args = append(args, "--resume", sid.(string))
 	}
@@ -198,7 +282,6 @@ func callClaudeJSON(prompt string, channelID string, workDir string) (*ClaudeRes
 
 	err := cmd.Run()
 	if err != nil {
-		// Check if stderr has useful info
 		if stderr.Len() > 0 {
 			return nil, fmt.Errorf("claude error: %w - %s", err, stderr.String())
 		}
@@ -207,135 +290,390 @@ func callClaudeJSON(prompt string, channelID string, workDir string) (*ClaudeRes
 
 	var resp ClaudeResponse
 	if err := json.Unmarshal(stdout.Bytes(), &resp); err != nil {
-		// If JSON parsing fails, return raw output as result
 		return &ClaudeResponse{
 			Result:  stdout.String(),
 			IsError: true,
 		}, fmt.Errorf("JSON parse error: %w - raw: %s", err, stdout.String())
 	}
 
-	// Store session ID for future messages
 	if resp.SessionID != "" {
 		claudeSessionIDs.Store(channelID, resp.SessionID)
+		saveSessionsToDisk()
 	}
 
 	return &resp, nil
 }
 
-// StreamEvent represents a JSON event from Claude's stream-json output
-type StreamEvent struct {
-	Type    string `json:"type"`
-	Subtype string `json:"subtype,omitempty"`
-	Message struct {
-		Content []struct {
-			Type string `json:"type"`
-			Text string `json:"text,omitempty"`
-		} `json:"content"`
-	} `json:"message,omitempty"`
-	Result    string `json:"result,omitempty"`
-	SessionID string `json:"session_id,omitempty"`
-	IsError   bool   `json:"is_error,omitempty"`
-	Usage     struct {
-		InputTokens  int `json:"input_tokens"`
-		OutputTokens int `json:"output_tokens"`
-	} `json:"usage,omitempty"`
-	DurationMs int `json:"duration_ms,omitempty"`
+// ============================================================================
+// Slack Thread Manager - posts separate messages for each event type
+// ============================================================================
+
+// SlackThreadManager manages messages in a Slack thread, posting separate messages per type
+type SlackThreadManager struct {
+	config    *Config
+	channelID string
+	threadTS  string
+
+	// Current assistant message accumulator
+	currentAssistantTS      string
+	currentAssistantContent strings.Builder
+	lastAssistantUpdate     time.Time
+
+	// Track tool calls in progress
+	activeTools map[string]string // tool_use_id -> messageTS
+
+	// Tool batching (accumulate same tool calls within 1s window)
+	batchedToolName   string
+	batchedToolInputs []string
+	batchedToolTimer  *time.Timer
+
+	// Track if system init was already posted
+	systemInitPosted bool
+
+	mu sync.Mutex
 }
 
-// SlackUpdater handles batched updates to a Slack message
-type SlackUpdater struct {
-	config       *Config
-	channelID    string
-	threadTS     string
-	messageTS    string
-	content      strings.Builder
-	lastUpdate   time.Time
-	updateCount  int
-	mu           sync.Mutex
-}
-
-// Update adds content and triggers Slack update if needed
-func (su *SlackUpdater) Update(text string) {
-	su.mu.Lock()
-	defer su.mu.Unlock()
-
-	su.content.WriteString(text)
-
-	// Micro-batch: update every 500ms or 300 chars
-	// Also update on first content to show immediate progress
-	sinceLastUpdate := time.Since(su.lastUpdate)
-	contentLen := su.content.Len()
-
-	isFirstUpdate := su.updateCount == 0
-	shouldUpdate := isFirstUpdate ||
-		sinceLastUpdate >= 500*time.Millisecond ||
-		(contentLen >= 300 && sinceLastUpdate >= 200*time.Millisecond)
-
-	if shouldUpdate && contentLen > 0 {
-		su.flush()
+// NewSlackThreadManager creates a new thread manager
+func NewSlackThreadManager(config *Config, channelID, threadTS string) *SlackThreadManager {
+	return &SlackThreadManager{
+		config:      config,
+		channelID:   channelID,
+		threadTS:    threadTS,
+		activeTools: make(map[string]string),
 	}
 }
 
-// flush sends current content to Slack
-func (su *SlackUpdater) flush() {
-	content := su.content.String()
+// PostThinking posts a thinking indicator
+func (m *SlackThreadManager) PostThinking() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	ts, _ := sendMessageToThreadGetTS(m.config, m.channelID, m.threadTS, ":hourglass_flowing_sand: _Thinking..._")
+	m.currentAssistantTS = ts
+}
+
+// PostSystemInit posts system initialization info (only once per session)
+func (m *SlackThreadManager) PostSystemInit(event *StreamEvent) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	// Only post once
+	if m.systemInitPosted {
+		return
+	}
+	m.systemInitPosted = true
+
+	msg := fmt.Sprintf(":zap: *Claude started*\n• Session: `%s`\n• Model: `%s`\n• CWD: `%s`",
+		event.SessionID, event.Model, event.Cwd)
+	sendMessageToThread(m.config, m.channelID, m.threadTS, msg)
+}
+
+// UpdateAssistantText accumulates and updates assistant text (batched)
+func (m *SlackThreadManager) UpdateAssistantText(text string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	// Flush any pending tool batch before assistant text
+	m.flushToolBatchLocked()
+
+	m.currentAssistantContent.WriteString(text)
+
+	// Micro-batch: update every 500ms or 500 chars
+	sinceLastUpdate := time.Since(m.lastAssistantUpdate)
+	contentLen := m.currentAssistantContent.Len()
+
+	shouldUpdate := m.currentAssistantTS == "" || // First content
+		sinceLastUpdate >= 500*time.Millisecond ||
+		(contentLen >= 500 && sinceLastUpdate >= 200*time.Millisecond)
+
+	if shouldUpdate && contentLen > 0 {
+		m.flushAssistantText(false)
+	}
+}
+
+// flushAssistantText sends accumulated text to Slack
+func (m *SlackThreadManager) flushAssistantText(final bool) {
+	content := m.currentAssistantContent.String()
 	if content == "" {
 		return
 	}
 
-	// Convert markdown for display
-	displayContent := markdownToSlack(content) + "\n\n_streaming..._"
-
-	if su.messageTS == "" {
-		// First message - post new
-		ts, err := sendMessageToThreadGetTS(su.config, su.channelID, su.threadTS, displayContent)
-		if err == nil && ts != "" {
-			su.messageTS = ts
-		}
-	} else {
-		// Update existing message
-		updateMessage(su.config, su.channelID, su.messageTS, displayContent)
-	}
-
-	su.lastUpdate = time.Now()
-	su.updateCount++
-}
-
-// Finalize sends the final content with stats
-func (su *SlackUpdater) Finalize(resp *ClaudeResponse) {
-	su.mu.Lock()
-	defer su.mu.Unlock()
-
-	content := resp.Result
-	if content == "" {
-		content = su.content.String()
-	}
-	if content == "" {
-		content = "(no response)"
-	}
-
-	// Convert markdown and add footer
 	displayContent := markdownToSlack(content)
-	footer := fmt.Sprintf("\n\n_tokens: %d in / %d out | %dms_",
-		resp.Usage.InputTokens, resp.Usage.OutputTokens, resp.DurationMs)
+	if !final {
+		displayContent += "\n\n_..._"
+	}
 
-	finalContent := displayContent + footer
-
-	if su.messageTS == "" {
-		sendMessageToThread(su.config, su.channelID, su.threadTS, finalContent)
+	if m.currentAssistantTS == "" {
+		ts, _ := sendMessageToThreadGetTS(m.config, m.channelID, m.threadTS, displayContent)
+		m.currentAssistantTS = ts
 	} else {
-		updateMessage(su.config, su.channelID, su.messageTS, finalContent)
+		updateMessage(m.config, m.channelID, m.currentAssistantTS, displayContent)
+	}
+
+	m.lastAssistantUpdate = time.Now()
+}
+
+// FinalizeAssistantText finalizes the current assistant message
+func (m *SlackThreadManager) FinalizeAssistantText() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	m.flushAssistantText(true)
+	// Reset for next assistant message
+	m.currentAssistantTS = ""
+	m.currentAssistantContent.Reset()
+}
+
+// PostThinkingBlock posts a thinking block as a separate collapsed message
+func (m *SlackThreadManager) PostThinkingBlock(thinking string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	// Truncate if too long
+	if len(thinking) > 500 {
+		thinking = thinking[:500] + "..."
+	}
+
+	msg := fmt.Sprintf(":brain: _Thinking..._\n```\n%s\n```", thinking)
+	sendMessageToThread(m.config, m.channelID, m.threadTS, msg)
+}
+
+// PostToolUseStart posts a tool use start message (batched for same tool within 1s)
+func (m *SlackThreadManager) PostToolUseStart(toolName string, toolID string, input json.RawMessage) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	// First, finalize any pending assistant text
+	if m.currentAssistantContent.Len() > 0 {
+		m.flushAssistantText(true)
+		m.currentAssistantTS = ""
+		m.currentAssistantContent.Reset()
+	}
+
+	inputStr := formatToolInput(toolName, input)
+
+	// If same tool as current batch, add to batch
+	if m.batchedToolName == toolName {
+		m.batchedToolInputs = append(m.batchedToolInputs, inputStr)
+		// Reset timer
+		if m.batchedToolTimer != nil {
+			m.batchedToolTimer.Stop()
+		}
+		m.batchedToolTimer = time.AfterFunc(1*time.Second, func() {
+			m.flushToolBatch()
+		})
+		return
+	}
+
+	// Different tool - flush existing batch first
+	if m.batchedToolName != "" {
+		m.flushToolBatchLocked()
+	}
+
+	// Start new batch
+	m.batchedToolName = toolName
+	m.batchedToolInputs = []string{inputStr}
+	m.batchedToolTimer = time.AfterFunc(1*time.Second, func() {
+		m.flushToolBatch()
+	})
+}
+
+// flushToolBatch flushes the batched tool calls (acquires lock)
+func (m *SlackThreadManager) flushToolBatch() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.flushToolBatchLocked()
+}
+
+// flushToolBatchLocked flushes the batched tool calls (must hold lock)
+func (m *SlackThreadManager) flushToolBatchLocked() {
+	if m.batchedToolName == "" || len(m.batchedToolInputs) == 0 {
+		return
+	}
+
+	if m.batchedToolTimer != nil {
+		m.batchedToolTimer.Stop()
+		m.batchedToolTimer = nil
+	}
+
+	emoji := getToolEmoji(m.batchedToolName)
+	var msg string
+	if len(m.batchedToolInputs) == 1 {
+		msg = fmt.Sprintf("%s *%s*\n%s", emoji, m.batchedToolName, m.batchedToolInputs[0])
+	} else {
+		msg = fmt.Sprintf("%s *%s* ×%d\n%s", emoji, m.batchedToolName, len(m.batchedToolInputs), strings.Join(m.batchedToolInputs, "\n"))
+	}
+	sendMessageToThread(m.config, m.channelID, m.threadTS, msg)
+
+	m.batchedToolName = ""
+	m.batchedToolInputs = nil
+}
+
+// PostToolResult posts a tool result
+func (m *SlackThreadManager) PostToolResult(toolUseID string, result json.RawMessage, isError bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	// Flush any pending tool batch
+	m.flushToolBatchLocked()
+
+	// Format result
+	resultStr := string(result)
+	if len(resultStr) > 1000 {
+		resultStr = resultStr[:1000] + "..."
+	}
+
+	var msg string
+	if isError {
+		msg = fmt.Sprintf(":x: *Error*\n```\n%s\n```", resultStr)
+	} else {
+		// Truncate success results more aggressively
+		if len(resultStr) > 300 {
+			resultStr = resultStr[:300] + "..."
+		}
+		msg = fmt.Sprintf(":white_check_mark: ```\n%s\n```", resultStr)
+	}
+
+	// Update the tool message if we have it, otherwise post new
+	if _, ok := m.activeTools[toolUseID]; ok {
+		delete(m.activeTools, toolUseID)
+	}
+	sendMessageToThread(m.config, m.channelID, m.threadTS, msg)
+}
+
+// PostFinalResult posts the final result with stats
+func (m *SlackThreadManager) PostFinalResult(resp *ClaudeResponse) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	// Flush any pending tool batch
+	m.flushToolBatchLocked()
+
+	// Finalize any pending assistant text first
+	if m.currentAssistantContent.Len() > 0 {
+		m.flushAssistantText(true)
+	}
+
+	// Check if context is getting large (warn at 150k tokens, typical limit is ~200k)
+	totalTokens := resp.Usage.InputTokens + resp.Usage.OutputTokens
+	var warningMsg string
+	if totalTokens > 150000 {
+		warningMsg = "\n:warning: *Context getting large!* Use `!claude_compact` to summarize."
+	} else if totalTokens > 100000 {
+		warningMsg = "\n:bulb: _Context: " + fmt.Sprintf("%dk", totalTokens/1000) + " tokens_"
+	}
+
+	// Post stats
+	statsMsg := fmt.Sprintf(":checkered_flag: *Done* | %d turns | %d in / %d out tokens | %dms%s",
+		resp.NumTurns,
+		resp.Usage.InputTokens,
+		resp.Usage.OutputTokens,
+		resp.DurationMs,
+		warningMsg)
+
+	sendMessageToThread(m.config, m.channelID, m.threadTS, statsMsg)
+}
+
+// PostError posts an error message
+func (m *SlackThreadManager) PostError(errMsg string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	msg := fmt.Sprintf(":rotating_light: *Error*\n```\n%s\n```", errMsg)
+	sendMessageToThread(m.config, m.channelID, m.threadTS, msg)
+}
+
+// getToolEmoji returns an emoji for a tool name
+func getToolEmoji(toolName string) string {
+	switch strings.ToLower(toolName) {
+	case "bash", "execute", "command":
+		return ":computer:"
+	case "read", "readfile":
+		return ":page_facing_up:"
+	case "write", "writefile", "edit":
+		return ":pencil:"
+	case "glob", "find":
+		return ":mag:"
+	case "grep", "search":
+		return ":mag_right:"
+	case "task", "subagent":
+		return ":robot_face:"
+	case "webfetch", "webrequest":
+		return ":globe_with_meridians:"
+	case "todowrite":
+		return ":clipboard:"
+	case "askuserquestion":
+		return ":question:"
+	case "websearch":
+		return ":mag:"
+	default:
+		return ":wrench:"
 	}
 }
 
-// GetContent returns accumulated content
-func (su *SlackUpdater) GetContent() string {
-	su.mu.Lock()
-	defer su.mu.Unlock()
-	return su.content.String()
+// formatToolInput formats tool input for display
+func formatToolInput(toolName string, input json.RawMessage) string {
+	var data map[string]interface{}
+	if err := json.Unmarshal(input, &data); err != nil {
+		return ""
+	}
+
+	switch strings.ToLower(toolName) {
+	case "bash", "execute":
+		if cmd, ok := data["command"].(string); ok {
+			if len(cmd) > 200 {
+				cmd = cmd[:200] + "..."
+			}
+			return fmt.Sprintf("```\n%s\n```", cmd)
+		}
+	case "read", "readfile":
+		if path, ok := data["file_path"].(string); ok {
+			return fmt.Sprintf("`%s`", path)
+		}
+	case "write", "writefile":
+		if path, ok := data["file_path"].(string); ok {
+			return fmt.Sprintf("`%s`", path)
+		}
+	case "edit":
+		if path, ok := data["file_path"].(string); ok {
+			return fmt.Sprintf("`%s`", path)
+		}
+	case "glob":
+		if pattern, ok := data["pattern"].(string); ok {
+			return fmt.Sprintf("`%s`", pattern)
+		}
+	case "grep":
+		if pattern, ok := data["pattern"].(string); ok {
+			return fmt.Sprintf("`%s`", pattern)
+		}
+	case "task":
+		if desc, ok := data["description"].(string); ok {
+			return fmt.Sprintf("_%s_", desc)
+		}
+	case "webfetch":
+		if url, ok := data["url"].(string); ok {
+			return fmt.Sprintf("<%s>", url)
+		}
+	case "websearch":
+		if query, ok := data["query"].(string); ok {
+			return fmt.Sprintf("_%s_", query)
+		}
+	}
+
+	// Default: show truncated JSON
+	raw, _ := json.Marshal(data)
+	s := string(raw)
+	if len(s) > 100 {
+		s = s[:100] + "..."
+	}
+	return fmt.Sprintf("`%s`", s)
 }
 
-// callClaudeStreaming calls Claude with streaming output and updates Slack in real-time
+// ============================================================================
+// Main streaming function
+// ============================================================================
+
+// callClaudeStreaming calls Claude with streaming output and posts separate Slack messages
 func callClaudeStreaming(prompt string, channelID string, threadTS string, workDir string, config *Config) (*ClaudeResponse, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancel()
@@ -351,7 +689,6 @@ func callClaudeStreaming(prompt string, channelID string, threadTS string, workD
 		"--verbose",
 	}
 
-	// Resume session if one exists for this channel
 	if sid, ok := claudeSessionIDs.Load(channelID); ok {
 		args = append(args, "--resume", sid.(string))
 	}
@@ -368,23 +705,12 @@ func callClaudeStreaming(prompt string, channelID string, threadTS string, workD
 		return nil, fmt.Errorf("failed to start claude: %w", err)
 	}
 
-	// Create Slack updater for batched updates
-	updater := &SlackUpdater{
-		config:     config,
-		channelID:  channelID,
-		threadTS:   threadTS,
-		lastUpdate: time.Now(),
-	}
-
-	// Post initial "thinking" message immediately
-	ts, _ := sendMessageToThreadGetTS(config, channelID, threadTS, ":hourglass_flowing_sand: _Claude is thinking..._")
-	if ts != "" {
-		updater.messageTS = ts
-	}
+	// Create thread manager for separate messages
+	manager := NewSlackThreadManager(config, channelID, threadTS)
+	manager.PostThinking()
 
 	var finalResponse ClaudeResponse
 	scanner := bufio.NewScanner(stdout)
-	// Increase buffer for long lines
 	buf := make([]byte, 0, 64*1024)
 	scanner.Buffer(buf, 1024*1024)
 
@@ -396,54 +722,86 @@ func callClaudeStreaming(prompt string, channelID string, threadTS string, workD
 
 		var event StreamEvent
 		if err := json.Unmarshal([]byte(line), &event); err != nil {
-			continue // Skip malformed lines
+			continue
+		}
+
+		// Store session ID
+		if event.SessionID != "" && finalResponse.SessionID == "" {
+			finalResponse.SessionID = event.SessionID
+			claudeSessionIDs.Store(channelID, event.SessionID)
+			saveSessionsToDisk()
 		}
 
 		switch event.Type {
+		case "system":
+			if event.Subtype == "init" && event.Model != "" {
+				manager.PostSystemInit(&event)
+			}
+
 		case "assistant":
-			// Extract text from content array
-			for _, content := range event.Message.Content {
-				if content.Type == "text" && content.Text != "" {
-					updater.Update(content.Text)
+			if event.Message != nil {
+				for _, content := range event.Message.Content {
+					switch content.Type {
+					case "text":
+						if content.Text != "" {
+							manager.UpdateAssistantText(content.Text)
+						}
+					case "thinking":
+						if content.Thinking != "" {
+							manager.PostThinkingBlock(content.Thinking)
+						}
+					case "tool_use":
+						manager.FinalizeAssistantText()
+						manager.PostToolUseStart(content.Name, content.ID, content.Input)
+					case "tool_result":
+						manager.PostToolResult(content.ToolUseID, content.Content, content.IsError)
+					}
 				}
 			}
-			if event.SessionID != "" {
-				finalResponse.SessionID = event.SessionID
-				claudeSessionIDs.Store(channelID, event.SessionID)
-			}
+
+		case "tool_use":
+			manager.FinalizeAssistantText()
+			manager.PostToolUseStart(event.ToolName, "", event.ToolInput)
+
+		case "tool_result":
+			manager.PostToolResult("", event.Result, event.IsError)
 
 		case "result":
-			// Final result with stats
-			finalResponse.Result = event.Result
-			finalResponse.SessionID = event.SessionID
 			finalResponse.IsError = event.IsError
-			finalResponse.Usage.InputTokens = event.Usage.InputTokens
-			finalResponse.Usage.OutputTokens = event.Usage.OutputTokens
 			finalResponse.DurationMs = event.DurationMs
-
-			if event.SessionID != "" {
-				claudeSessionIDs.Store(channelID, event.SessionID)
+			finalResponse.NumTurns = event.NumTurns
+			if event.Usage != nil {
+				finalResponse.Usage.InputTokens = event.Usage.InputTokens
+				finalResponse.Usage.OutputTokens = event.Usage.OutputTokens
+				finalResponse.Usage.CacheCreationInputTokens = event.Usage.CacheCreationInputTokens
+				finalResponse.Usage.CacheReadInputTokens = event.Usage.CacheReadInputTokens
+			}
+			if event.Error != "" {
+				manager.PostError(event.Error)
+			}
+			// Try to extract result string
+			if len(event.Result) > 0 {
+				var resultStr string
+				if err := json.Unmarshal(event.Result, &resultStr); err == nil {
+					finalResponse.Result = resultStr
+				}
 			}
 		}
 	}
 
 	cmd.Wait()
 
-	// Use accumulated content if result is empty
-	if finalResponse.Result == "" {
-		finalResponse.Result = updater.GetContent()
-	}
-
-	// Send final update with stats
-	updater.Finalize(&finalResponse)
+	// Finalize any remaining content
+	manager.FinalizeAssistantText()
+	manager.PostFinalResult(&finalResponse)
 
 	return &finalResponse, nil
 }
 
 // resetClaudeSession removes the stored session ID for a channel
-// Next message will start a fresh conversation
 func resetClaudeSession(channelID string) {
 	claudeSessionIDs.Delete(channelID)
+	saveSessionsToDisk()
 }
 
 // getClaudeSessionID returns the current session ID for a channel, if any
@@ -461,7 +819,6 @@ func markdownToSlack(text string) string {
 	inCodeBlock := false
 
 	for _, line := range lines {
-		// Track code blocks (don't modify content inside)
 		if strings.HasPrefix(line, "```") {
 			inCodeBlock = !inCodeBlock
 			result = append(result, line)
@@ -472,25 +829,31 @@ func markdownToSlack(text string) string {
 			continue
 		}
 
-		// Convert markdown headers (## Header -> *Header*)
+		// Convert horizontal rules (---, ***, ___) to Unicode line
 		trimmed := strings.TrimSpace(line)
+		if trimmed == "---" || trimmed == "***" || trimmed == "___" {
+			result = append(result, "───────────────────────")
+			continue
+		}
+
+		// Convert markdown headers
 		if strings.HasPrefix(trimmed, "#") {
-			// Count # symbols and extract header text
 			headerText := strings.TrimLeft(trimmed, "#")
 			headerText = strings.TrimSpace(headerText)
+			// Remove surrounding ** if present (e.g., ## **Title** -> Title)
+			headerText = strings.TrimPrefix(headerText, "**")
+			headerText = strings.TrimSuffix(headerText, "**")
 			if headerText != "" {
 				result = append(result, "*"+headerText+"*")
 				continue
 			}
 		}
 
-		// Detect and convert markdown tables
+		// Convert tables
 		if strings.HasPrefix(trimmed, "|") && strings.HasSuffix(trimmed, "|") {
-			// Skip separator lines (|---|---|)
 			if strings.Contains(trimmed, "---") {
 				continue
 			}
-			// Convert table row to simple format
 			cells := strings.Split(trimmed, "|")
 			var cleanCells []string
 			for _, cell := range cells {
@@ -500,7 +863,6 @@ func markdownToSlack(text string) string {
 				}
 			}
 			if len(cleanCells) >= 2 {
-				// Format as "key: value" for 2-column tables
 				result = append(result, fmt.Sprintf("*%s*: %s", cleanCells[0], strings.Join(cleanCells[1:], " | ")))
 			} else if len(cleanCells) == 1 {
 				result = append(result, cleanCells[0])
@@ -508,8 +870,7 @@ func markdownToSlack(text string) string {
 			continue
 		}
 
-		// Convert **bold** to *bold* (Slack style)
-		// But preserve single * (already Slack bold)
+		// Convert **bold** to *bold*
 		for strings.Contains(line, "**") {
 			start := strings.Index(line, "**")
 			end := strings.Index(line[start+2:], "**")
@@ -528,21 +889,17 @@ func markdownToSlack(text string) string {
 }
 
 // sendClaudeResponse formats and sends a Claude response to Slack
-// It handles long messages by splitting them into chunks
 func sendClaudeResponse(config *Config, channelID, threadTS string, resp *ClaudeResponse) {
 	result := resp.Result
 	if result == "" {
 		result = "(no response)"
 	}
 
-	// Convert markdown to Slack format
 	result = markdownToSlack(result)
 
-	// Footer with usage stats
 	footer := fmt.Sprintf("\n\n_tokens: %d in / %d out | %dms_",
 		resp.Usage.InputTokens, resp.Usage.OutputTokens, resp.DurationMs)
 
-	// Slack message limit is ~4000 chars, use 3500 to be safe
 	const maxLen = 3500
 
 	if len(result)+len(footer) < maxLen {
@@ -550,7 +907,6 @@ func sendClaudeResponse(config *Config, channelID, threadTS string, resp *Claude
 		return
 	}
 
-	// Split into chunks
 	chunks := splitMessageIntoChunks(result, maxLen)
 	for i, chunk := range chunks {
 		msg := chunk
@@ -562,7 +918,6 @@ func sendClaudeResponse(config *Config, channelID, threadTS string, resp *Claude
 }
 
 // splitMessageIntoChunks splits a message into chunks of maxLen
-// It tries to split on newlines or spaces when possible
 func splitMessageIntoChunks(text string, maxLen int) []string {
 	if len(text) <= maxLen {
 		return []string{text}
@@ -577,14 +932,10 @@ func splitMessageIntoChunks(text string, maxLen int) []string {
 			break
 		}
 
-		// Find a good break point
 		breakPoint := maxLen
-
-		// Try to find a newline
 		if idx := strings.LastIndex(remaining[:maxLen], "\n"); idx > maxLen/2 {
 			breakPoint = idx + 1
 		} else if idx := strings.LastIndex(remaining[:maxLen], " "); idx > maxLen/2 {
-			// Try to find a space
 			breakPoint = idx + 1
 		}
 

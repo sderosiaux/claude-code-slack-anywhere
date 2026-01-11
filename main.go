@@ -20,6 +20,9 @@ import (
 
 const version = "2.0.0"
 
+// buildTime is set at compile time via -ldflags
+var buildTime = "dev"
+
 // Global config manager and worker pool for graceful shutdown
 var (
 	configMgr  *ConfigManager
@@ -31,8 +34,37 @@ func logf(format string, args ...interface{}) {
 	fmt.Printf("[%s] %s\n", ts, fmt.Sprintf(format, args...))
 }
 
+func getHelpText() string {
+	return "*Claude Code Slack Anywhere - Commands*\n\n" +
+		":rocket: *Session Management*\n" +
+		"• `!new <name>` - Create new session with channel\n" +
+		"• `!reset` - Reset conversation context (start fresh)\n" +
+		"• `!kill` - Remove and archive current session\n" +
+		"• `!sessions` - List active sessions\n" +
+		"• `!projects` - List projects in projects folder\n\n" +
+		":computer: *Utilities*\n" +
+		"• `!c <cmd>` - Execute shell command\n\n" +
+		":information_source: *Other*\n" +
+		"• `!ping` - Check if bot is alive\n" +
+		"• `!version` - Show version\n" +
+		"• `!help` - Show this help\n\n" +
+		":speech_balloon: *In a session channel:*\n" +
+		"• Type messages to talk to Claude\n" +
+		"• `!claude_compact` - Summarize conversation (reduce tokens)\n" +
+		"• `!claude_clear` - Clear session and start fresh\n" +
+		"• `!claude_help` - Show Claude-specific commands"
+}
+
+type listenOpts struct {
+	configPath  string
+	projectsDir string
+	botToken    string
+	appToken    string
+	userIDs     []string
+}
+
 // Main listen loop using Socket Mode
-func listen() error {
+func listen(opts listenOpts) error {
 	myPid := os.Getpid()
 	logf("Starting (PID %d)", myPid)
 
@@ -46,12 +78,42 @@ func listen() error {
 	}
 
 	// Initialize config manager
-	configMgr = NewConfigManager()
+	configMgr = NewConfigManager(opts.configPath)
 	if err := configMgr.Load(); err != nil {
-		return fmt.Errorf("not configured. Run: claude-code-slack-anywhere setup <bot_token> <app_token>")
+		// If no config file and no CLI tokens, fail
+		if opts.botToken == "" || opts.appToken == "" {
+			return fmt.Errorf("not configured. Run: claude-code-slack-anywhere setup <bot_token> <app_token>")
+		}
+		// Create minimal config from CLI args
+		configMgr.config = &Config{Sessions: make(map[string]string)}
 	}
 
 	config := configMgr.Get()
+
+	// CLI overrides take precedence
+	if opts.projectsDir != "" {
+		config.ProjectsDir = opts.projectsDir
+	}
+	if opts.botToken != "" {
+		config.BotToken = opts.botToken
+	}
+	if opts.appToken != "" {
+		config.AppToken = opts.appToken
+	}
+	if len(opts.userIDs) > 0 {
+		config.UserIDs = opts.userIDs
+	}
+
+	// Validate mandatory config
+	if config.ProjectsDir == "" {
+		return fmt.Errorf("projects_dir is required: use --projects-dir or set in config file")
+	}
+	if config.BotToken == "" {
+		return fmt.Errorf("bot_token is required: use --bot-token or set in config file")
+	}
+	if config.AppToken == "" {
+		return fmt.Errorf("app_token is required: use --app-token or set in config file")
+	}
 	logf("Bot listening... (user: %s)", config.UserID)
 	logf("Active sessions: %d", len(configMgr.GetAllSessions()))
 	fmt.Println("Press Ctrl+C to stop")
@@ -215,13 +277,14 @@ func connectSocketMode(ctx context.Context, cfgMgr *ConfigManager) error {
 
 func handleSlackEvent(ctx context.Context, cfgMgr *ConfigManager, eventData json.RawMessage) {
 	var event struct {
-		Type    string      `json:"type"`
-		Channel string      `json:"channel"`
-		User    string      `json:"user"`
-		Text    string      `json:"text"`
-		TS      string      `json:"ts"`
-		BotID   string      `json:"bot_id"`
-		Files   []SlackFile `json:"files"`
+		Type     string      `json:"type"`
+		Channel  string      `json:"channel"`
+		User     string      `json:"user"`
+		Text     string      `json:"text"`
+		TS       string      `json:"ts"`
+		ThreadTS string      `json:"thread_ts"`
+		BotID    string      `json:"bot_id"`
+		Files    []SlackFile `json:"files"`
 	}
 	json.Unmarshal(eventData, &event)
 
@@ -238,7 +301,7 @@ func handleSlackEvent(ctx context.Context, cfgMgr *ConfigManager, eventData json
 	}
 
 	// Only accept from authorized user
-	if event.User != config.UserID {
+	if !config.IsAuthorizedUser(event.User) {
 		return
 	}
 
@@ -252,44 +315,45 @@ func handleSlackEvent(ctx context.Context, cfgMgr *ConfigManager, eventData json
 	}
 
 	channelID := event.Channel
+	threadTS := event.ThreadTS
 
 	logf("[message] @%s in %s: %s", event.User, channelID, text)
 
+	// Helper to reply in thread if we're in a thread, otherwise in channel
+	reply := func(msg string) {
+		if threadTS != "" {
+			sendMessageToThread(config, channelID, threadTS, msg)
+		} else {
+			sendMessage(config, channelID, msg)
+		}
+	}
+
 	// Handle commands
 	if strings.HasPrefix(text, "!ping") {
-		sendMessage(config, channelID, "pong!")
+		reply("pong!")
+		return
+	}
+
+	if strings.HasPrefix(text, "!version") {
+		reply(fmt.Sprintf("v%s (build: %s)", version, buildTime))
 		return
 	}
 
 	if strings.HasPrefix(text, "!help") {
-		helpText := "*Claude Code Slack Anywhere - Commands*\n\n" +
-			":rocket: *Session Management*\n" +
-			"• `!new <name>` - Create new session with channel\n" +
-			"• `!reset` - Reset conversation context (start fresh)\n" +
-			"• `!kill [name]` - Remove a session\n" +
-			"• `!list` - List active sessions\n\n" +
-			":computer: *Utilities*\n" +
-			"• `!c <cmd>` - Execute shell command\n\n" +
-			":information_source: *Other*\n" +
-			"• `!ping` - Check if bot is alive\n" +
-			"• `!help` - Show this help\n\n" +
-			":speech_balloon: *In a session channel:*\n" +
-			"• Type messages to talk to Claude\n" +
-			"• Use `//command` for Claude slash commands (e.g., `//help`, `//compact`)"
-		sendMessage(config, channelID, helpText)
+		reply(getHelpText())
 		return
 	}
 
-	if strings.HasPrefix(text, "!list") {
+	if strings.HasPrefix(text, "!sessions") || strings.HasPrefix(text, "!list") {
 		sessions := cfgMgr.GetAllSessions()
 		if len(sessions) == 0 {
-			sendMessage(config, channelID, "No active sessions")
+			reply("No active sessions")
 		} else {
 			var list []string
 			for name, cid := range sessions {
 				list = append(list, fmt.Sprintf("• `%s` → <#%s>", name, cid))
 			}
-			sendMessage(config, channelID, "*Active Sessions:*\n"+strings.Join(list, "\n"))
+			reply("*Active Sessions:*\n" + strings.Join(list, "\n"))
 		}
 		return
 	}
@@ -298,32 +362,36 @@ func handleSlackEvent(ctx context.Context, cfgMgr *ConfigManager, eventData json
 		// Reset Claude conversation context for this channel
 		sessionName := cfgMgr.GetSessionByChannel(channelID)
 		if sessionName == "" {
-			sendMessage(config, channelID, ":x: Not in a session channel. Use `!reset` in a session channel.")
+			reply(":x: Not in a session channel. Use `!reset` in a session channel.")
 			return
 		}
 		resetClaudeSession(channelID)
-		sendMessage(config, channelID, ":arrows_counterclockwise: Conversation reset! Next message starts a fresh context.")
+		reply(":arrows_counterclockwise: Conversation reset! Next message starts a fresh context.")
 		return
 	}
 
-	if strings.HasPrefix(text, "!kill") {
-		name := strings.TrimSpace(strings.TrimPrefix(text, "!kill"))
-		// If no arg provided, try to use the session for this channel
-		if name == "" {
-			name = cfgMgr.GetSessionByChannel(channelID)
-		}
-		if name == "" {
-			sendMessage(config, channelID, "Usage: `!kill [name]` - name optional if in session channel")
-			return
-		}
-		if _, exists := cfgMgr.GetSession(name); !exists {
-			sendMessage(config, channelID, fmt.Sprintf("Session '%s' not found", name))
-			return
-		}
-		// Reset Claude session ID and remove from config
+	if text == "!kill" {
+		name := cfgMgr.GetSessionByChannel(channelID)
+		// Reset Claude session ID and remove from config if exists
 		resetClaudeSession(channelID)
-		cfgMgr.DeleteSession(name)
-		sendMessage(config, channelID, fmt.Sprintf(":wastebasket: Session '%s' removed", name))
+		if name != "" {
+			cfgMgr.DeleteSession(name)
+		}
+		// Archive the channel
+		if err := archiveChannel(config, channelID); err != nil {
+			logf("Failed to archive channel: %v", err)
+			if name != "" {
+				reply(fmt.Sprintf(":wastebasket: Session '%s' removed (channel archive failed: %v)", name, err))
+			} else {
+				reply(fmt.Sprintf(":x: Channel archive failed: %v", err))
+			}
+		} else {
+			if name != "" {
+				reply(fmt.Sprintf(":wastebasket: Session '%s' removed and channel archived", name))
+			} else {
+				reply(":wastebasket: Channel archived")
+			}
+		}
 		return
 	}
 
@@ -333,7 +401,28 @@ func handleSlackEvent(ctx context.Context, cfgMgr *ConfigManager, eventData json
 		if err != nil {
 			output = fmt.Sprintf(":warning: %s\n\nExit: %v", output, err)
 		}
-		sendMessage(config, channelID, "```\n"+output+"\n```")
+		reply("```\n" + output + "\n```")
+		return
+	}
+
+	if strings.HasPrefix(text, "!projects") {
+		baseDir := getProjectsDir(config)
+		entries, err := os.ReadDir(baseDir)
+		if err != nil {
+			reply(fmt.Sprintf(":x: Cannot read projects dir: %v", err))
+			return
+		}
+		var projects []string
+		for _, entry := range entries {
+			if entry.IsDir() && !strings.HasPrefix(entry.Name(), ".") {
+				projects = append(projects, "• `"+entry.Name()+"`")
+			}
+		}
+		if len(projects) == 0 {
+			reply(fmt.Sprintf("No projects in `%s`", baseDir))
+		} else {
+			reply(fmt.Sprintf("*Projects in `%s`:*\n%s", baseDir, strings.Join(projects, "\n")))
+		}
 		return
 	}
 
@@ -387,19 +476,58 @@ func handleSlackEvent(ctx context.Context, cfgMgr *ConfigManager, eventData json
 		return
 	}
 
+	// Unknown ! command - show help
+	if strings.HasPrefix(text, "!") {
+		logf("Unknown command: %s", text)
+		reply(fmt.Sprintf(":question: Unknown command `%s`\n\n%s", strings.Split(text, " ")[0], getHelpText()))
+		return
+	}
+
 	// Check if message is in a session channel
 	sessionName := cfgMgr.GetSessionByChannel(channelID)
 	if sessionName != "" {
 		logf("Session found: %s", sessionName)
-		addReaction(config, channelID, event.TS, "eyes")
 
-		// Convert // to / for Claude slash commands (Slack intercepts single /)
-		// e.g., "//help" -> "/help", "//compact" -> "/compact"
-		claudeText := text
-		if strings.HasPrefix(claudeText, "//") {
-			claudeText = strings.TrimPrefix(claudeText, "/")
-			logf("Converted slash command: %s -> %s", text, claudeText)
+		// Handle !claude_* commands (Claude Code slash commands)
+		if strings.HasPrefix(text, "!claude_") {
+			claudeCmd := strings.TrimPrefix(text, "!claude_")
+			switch claudeCmd {
+			case "compact":
+				addReaction(config, channelID, event.TS, "hourglass_flowing_sand")
+				workerPool.Submit(func() {
+					baseDir := getProjectsDir(config)
+					workDir := filepath.Join(baseDir, sessionName)
+					resp, err := callClaudeStreaming("/compact", channelID, event.TS, workDir, config)
+					removeReaction(config, channelID, event.TS, "hourglass_flowing_sand")
+					if err != nil {
+						addReaction(config, channelID, event.TS, "x")
+						sendMessageToThread(config, channelID, event.TS, fmt.Sprintf(":x: Compact failed: %v", err))
+					} else {
+						addReaction(config, channelID, event.TS, "white_check_mark")
+						sendMessageToThread(config, channelID, event.TS, fmt.Sprintf(":broom: *Conversation compacted!*\nNew context: %d tokens", resp.Usage.InputTokens))
+					}
+				})
+				return
+			case "clear":
+				resetClaudeSession(channelID)
+				addReaction(config, channelID, event.TS, "white_check_mark")
+				sendMessageToThread(config, channelID, event.TS, ":wastebasket: *Session cleared!* Next message starts fresh.")
+				return
+			case "help":
+				helpMsg := "*Claude Commands:*\n" +
+					"• `!claude_compact` - Summarize conversation to reduce context size\n" +
+					"• `!claude_clear` - Clear session and start fresh\n" +
+					"• `!claude_help` - Show this help"
+				sendMessageToThread(config, channelID, event.TS, helpMsg)
+				return
+			default:
+				sendMessageToThread(config, channelID, event.TS, fmt.Sprintf(":question: Unknown command `!claude_%s`. Try `!claude_help`", claudeCmd))
+				return
+			}
 		}
+
+		addReaction(config, channelID, event.TS, "eyes")
+		claudeText := text
 
 		// Handle image attachments
 		var imagePaths []string
@@ -534,7 +662,7 @@ func handleSlackEvent(ctx context.Context, cfgMgr *ConfigManager, eventData json
 
 func handleBlockAction(config *Config, action BlockActionPayload) {
 	// Only accept from authorized user
-	if action.User.ID != config.UserID {
+	if !config.IsAuthorizedUser(action.User.ID) {
 		return
 	}
 
@@ -559,14 +687,19 @@ Control Claude Code remotely via Slack.
 COMMANDS:
     setup <bot> <app>       Complete setup (tokens, hook, service)
     doctor                  Check all dependencies and configuration
-    listen                  Start the Slack bot listener manually
+    listen [options]        Start the Slack bot listener manually
+        --config <path>       Path to config file (default: ~/.ccsa.json)
+        --projects-dir <path> Base directory for projects
+        --bot-token <token>   Slack bot token (xoxb-...)
+        --app-token <token>   Slack app token (xapp-...)
+        --user-ids <ids>      Authorized Slack user IDs (comma-separated)
     install                 Install Claude hook manually
     hook                    Handle Claude hook (internal)
 
 SLACK COMMANDS (in any channel):
     !ping                   Check if bot is alive
     !new <name>             Create new session with channel
-    !kill <name>            Remove a session
+    !kill                   Remove current session
     !list                   List active sessions
     !reset                  Reset conversation context
     !c <cmd>                Execute shell command
@@ -614,7 +747,26 @@ func main() {
 		doctor()
 
 	case "listen":
-		if err := listen(); err != nil {
+		var opts listenOpts
+		for i := 2; i < len(os.Args); i++ {
+			if os.Args[i] == "--projects-dir" && i+1 < len(os.Args) {
+				opts.projectsDir = os.Args[i+1]
+				i++
+			} else if os.Args[i] == "--config" && i+1 < len(os.Args) {
+				opts.configPath = os.Args[i+1]
+				i++
+			} else if os.Args[i] == "--bot-token" && i+1 < len(os.Args) {
+				opts.botToken = os.Args[i+1]
+				i++
+			} else if os.Args[i] == "--app-token" && i+1 < len(os.Args) {
+				opts.appToken = os.Args[i+1]
+				i++
+			} else if os.Args[i] == "--user-ids" && i+1 < len(os.Args) {
+				opts.userIDs = strings.Split(os.Args[i+1], ",")
+				i++
+			}
+		}
+		if err := listen(opts); err != nil {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 			os.Exit(1)
 		}

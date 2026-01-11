@@ -551,3 +551,19 @@ func getChannelName(config *Config, channelID string) (string, error) {
 
 	return result.Channel.Name, nil
 }
+
+// archiveChannel archives a Slack channel
+func archiveChannel(config *Config, channelID string) error {
+	params := url.Values{
+		"channel": {channelID},
+	}
+
+	result, err := slackAPI(config, "conversations.archive", params)
+	if err != nil {
+		return err
+	}
+	if !result.OK {
+		return fmt.Errorf("failed to archive channel: %s", result.Error)
+	}
+	return nil
+}

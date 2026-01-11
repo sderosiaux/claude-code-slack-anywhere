@@ -57,6 +57,9 @@ flowchart LR
 
 ## Why Slack?
 
+- **Works offline** - Queue messages while commuting, responses arrive when you're back online (both input AND output work async)
+- **Voice input** - Slack's built-in microphone means hands-free coding prompts
+- **Threads = Sessions** - Each thread is a task with full context continuity. New message = new task
 - **Familiar UX** - No new app to learn, works on phone/desktop
 - **Shareable** - Invite teammates to project channels (if you trust them!)
 - **Rich formatting** - Code blocks, threads, reactions, file uploads
@@ -118,6 +121,16 @@ Get your User ID: Slack → Profile → **...** → **Copy member ID**
 claude-code-slack-anywhere listen
 ```
 
+Or with CLI options (override config file):
+```bash
+claude-code-slack-anywhere listen \
+  --config ~/.ccsa.json \
+  --projects-dir ~/code/ai-projects \
+  --bot-token xoxb-... \
+  --app-token xapp-... \
+  --user-ids U03UHMKRX,U12345678
+```
+
 Keep this running (or [set up as a service](#running-as-a-service-macos)). That's it! Now control Claude entirely from Slack.
 
 ## Usage
@@ -129,8 +142,8 @@ Type these in any channel where the bot is present:
 | Command | Description |
 |---------|-------------|
 | `!new <name>` | Create new session + channel |
-| `!kill [name]` | Remove a session (name optional in session channel) |
-| `!reset` | Reset Claude's conversation memory (in session channel) |
+| `!kill` | Remove session and archive channel (use in any channel) |
+| `!reset` | Reset Claude's conversation memory |
 | `!list` | List active sessions |
 | `!ping` | Check if bot is alive |
 | `!help` | Show all commands |
@@ -189,8 +202,8 @@ Config is stored in `~/.ccsa.json`:
 {
   "bot_token": "xoxb-your-bot-token",
   "app_token": "xapp-your-app-token",
-  "user_id": "U01234567",
-  "projects_dir": "~/Desktop/ai-projects"
+  "user_ids": ["U01234567", "U98765432"],
+  "projects_dir": "~/code/ai-projects"
 }
 ```
 
@@ -198,8 +211,10 @@ Config is stored in `~/.ccsa.json`:
 |-------|-------------|
 | `bot_token` | Slack Bot User OAuth Token (xoxb-...) |
 | `app_token` | Slack App-Level Token (xapp-...) |
-| `user_id` | Your Slack member ID (for authorization) |
-| `projects_dir` | Base directory for projects (default: `~/Desktop/ai-projects`) |
+| `user_ids` | Authorized Slack member IDs (array) |
+| `projects_dir` | **Required.** Base directory for projects |
+
+> **Note:** `user_id` (singular string) is still supported for backward compatibility.
 
 ## Security
 
