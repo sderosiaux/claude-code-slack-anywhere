@@ -2,6 +2,8 @@
 
 > Control [Claude Code](https://docs.anthropic.com/en/docs/claude-code) from your phone via Slack. Each channel = one project folder on your machine.
 
+**[Website](https://sderosiaux.github.io/claudeslack)** · **[GitHub](https://github.com/sderosiaux/claudeslack)**
+
 ![claudeslack Interface](docs/slack-interface.png)
 
 ```mermaid
