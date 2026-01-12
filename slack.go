@@ -245,51 +245,45 @@ func isImageFile(file SlackFile) bool {
 }
 
 // isTextFile checks if a Slack file is a text/code file that Claude can read
+// We use a blacklist approach: accept everything except known binary formats
 func isTextFile(file SlackFile) bool {
-	// Check by mimetype
-	textMimes := []string{
-		"text/",
-		"application/json",
-		"application/xml",
-		"application/javascript",
-		"application/typescript",
-		"application/x-yaml",
-		"application/x-sh",
-		"application/sql",
+	// Binary mimetypes to exclude
+	binaryMimes := []string{
+		"application/octet-stream",
+		"application/zip",
+		"application/gzip",
+		"application/x-tar",
+		"application/x-rar",
+		"application/pdf",
+		"application/msword",
+		"application/vnd.ms-",
+		"application/vnd.openxmlformats-",
+		"audio/",
+		"video/",
 	}
-	for _, prefix := range textMimes {
+	for _, prefix := range binaryMimes {
 		if strings.HasPrefix(file.Mimetype, prefix) {
-			return true
+			return false
 		}
 	}
-	// Check by extension
-	textExts := []string{
-		".go", ".py", ".js", ".ts", ".tsx", ".jsx",
-		".json", ".yaml", ".yml", ".toml", ".xml",
-		".md", ".txt", ".log", ".csv",
-		".html", ".css", ".scss", ".less",
-		".sh", ".bash", ".zsh", ".fish",
-		".sql", ".graphql", ".proto",
-		".rs", ".rb", ".php", ".java", ".kt", ".swift",
-		".c", ".cpp", ".h", ".hpp",
-		".env", ".gitignore", ".dockerignore",
-		".dockerfile", ".makefile",
+
+	// Binary extensions to exclude
+	binaryExts := []string{
+		".zip", ".tar", ".gz", ".rar", ".7z",
+		".exe", ".dll", ".so", ".dylib",
+		".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx",
+		".mp3", ".mp4", ".wav", ".avi", ".mov", ".mkv",
+		".bin", ".dat", ".o", ".a",
 	}
 	ext := strings.ToLower(filepath.Ext(file.Name))
-	for _, e := range textExts {
+	for _, e := range binaryExts {
 		if ext == e {
-			return true
+			return false
 		}
 	}
-	// Also check common filenames without extensions
-	lowerName := strings.ToLower(file.Name)
-	specialFiles := []string{"dockerfile", "makefile", "gemfile", "rakefile", "procfile"}
-	for _, f := range specialFiles {
-		if lowerName == f {
-			return true
-		}
-	}
-	return false
+
+	// Everything else is considered text (snippets, code, markdown, etc.)
+	return true
 }
 
 func sendMessage(config *Config, channelID string, text string) (string, error) {

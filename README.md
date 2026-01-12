@@ -89,6 +89,10 @@ flowchart LR
 | **Visual Status** | 👀 processing → ✅ done (or ❌ error) |
 | **File Uploads** | Drop images or code files - saved to project's `.slack-uploads/` folder |
 | **Interactive** | Answer Claude's questions via buttons |
+| **Fork Sessions** | Branch conversations into threads with `!fork` |
+| **Scheduled Tasks** | Run tasks later with `!at 5m run tests` |
+| **Auto-Compact** | Automatically compacts context when too long |
+| **Quiet Mode** | Hide read operations with `!quiet` |
 
 ## Requirements
 
@@ -157,21 +161,37 @@ Type these in any channel where the bot is present:
 | Command | Description |
 |---------|-------------|
 | `!new <name>` | Create new session + channel |
-| `!kill` | Remove session and archive channel (use in any channel) |
+| `!kill` | Remove session and archive channel |
 | `!reset` | Reset Claude's conversation memory |
-| `!list` | List active sessions |
+| `!sessions` | List active sessions |
 | `!ping` | Check if bot is alive |
 | `!help` | Show all commands |
 | `!c <cmd>` | Run shell command on your machine |
+| `!cancel` | Cancel running task |
+| `!verbose` / `!quiet` | Toggle output verbosity |
 
 ### In a Session Channel
 
 | Input | Description |
 |-------|-------------|
 | Any message | Sent directly to Claude |
+| `!task <prompt>` | Start a fresh task in a new thread |
+| `!fork <prompt>` | Fork session into a thread (keeps context) |
 | `!claude_compact` | Summarize conversation (reduce tokens) |
 | `!claude_clear` | Clear session and start fresh |
-| `!claude_help` | Show Claude-specific commands |
+
+### Scheduled Tasks
+
+Schedule tasks to run later:
+
+```
+!at 5m run npm test           # in 5 minutes
+!at 1h deploy to staging      # in 1 hour
+!at 9am run daily backup      # at 9am (tomorrow if already past)
+!at tomorrow 10am npm build   # tomorrow at 10am
+!scheduled                    # list scheduled tasks
+!unschedule task-1            # cancel a task
+```
 
 ### Auto-Session Detection
 

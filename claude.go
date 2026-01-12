@@ -45,9 +45,10 @@ type ClaudeResponse struct {
 		CacheCreationInputTokens int `json:"cache_creation_input_tokens"`
 		CacheReadInputTokens     int `json:"cache_read_input_tokens"`
 	} `json:"usage"`
-	DurationMs int  `json:"duration_ms"`
-	IsError    bool `json:"is_error"`
-	NumTurns   int  `json:"num_turns"`
+	DurationMs   int  `json:"duration_ms"`
+	IsError      bool `json:"is_error"`
+	NumTurns     int  `json:"num_turns"`
+	NeedsCompact bool `json:"-"` // Internal flag for auto-compact
 }
 
 // ============================================================================
@@ -156,6 +157,37 @@ var (
 	binPath    string
 	claudePath string
 )
+
+// Active Claude processes per channel (for !cancel)
+var activeProcesses sync.Map // channelID -> *exec.Cmd
+
+// Verbose mode per channel (default: true = verbose)
+var verboseMode sync.Map // channelID -> bool
+
+// IsVerbose returns whether verbose mode is enabled for a channel (default: true)
+func IsVerbose(channelID string) bool {
+	if v, ok := verboseMode.Load(channelID); ok {
+		return v.(bool)
+	}
+	return true // default verbose
+}
+
+// SetVerbose sets the verbose mode for a channel
+func SetVerbose(channelID string, verbose bool) {
+	verboseMode.Store(channelID, verbose)
+}
+
+// CancelClaudeProcess cancels any running Claude process for a channel
+func CancelClaudeProcess(channelID string) bool {
+	if cmd, ok := activeProcesses.Load(channelID); ok {
+		if process := cmd.(*exec.Cmd); process != nil && process.Process != nil {
+			process.Process.Kill()
+			activeProcesses.Delete(channelID)
+			return true
+		}
+	}
+	return false
+}
 
 func init() {
 	if exe, err := os.Executable(); err == nil {
@@ -566,6 +598,15 @@ func (m *SlackThreadManager) PostToolUseStart(toolName string, toolID string, in
 	// Record activity
 	m.recordActivityLocked()
 
+	// In quiet mode, skip read-only tools (Bash, Read, Grep, Glob)
+	// Only show write operations (Edit, Write) and important tools
+	if !IsVerbose(m.channelID) {
+		group := getToolBatchGroup(toolName)
+		if group == "read" {
+			return // Skip read tools in quiet mode
+		}
+	}
+
 	// First, finalize any pending assistant text
 	if m.currentAssistantContent.Len() > 0 {
 		m.flushAssistantText(true)
@@ -636,6 +677,11 @@ func (m *SlackThreadManager) PostToolResult(toolUseID string, result json.RawMes
 
 	// Record activity
 	m.recordActivityLocked()
+
+	// In quiet mode, skip non-error results
+	if !IsVerbose(m.channelID) && !isError {
+		return
+	}
 
 	// Flush any pending tool batch
 	m.flushToolBatchLocked()
@@ -745,6 +791,15 @@ func (m *SlackThreadManager) PostError(errMsg string) {
 	sendMessageToThread(m.config, m.channelID, m.threadTS, msg)
 }
 
+// PostAutoCompactNotice posts a notice that auto-compact will be triggered
+func (m *SlackThreadManager) PostAutoCompactNotice() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	msg := ":warning: *Context too long!* Auto-compacting conversation..."
+	sendMessageToThread(m.config, m.channelID, m.threadTS, msg)
+}
+
 // getToolEmoji returns an emoji for a tool name
 func getToolEmoji(toolName string) string {
 	switch strings.ToLower(toolName) {
@@ -809,6 +864,25 @@ func formatToolInput(toolName string, input json.RawMessage) string {
 		}
 	case "edit":
 		if path, ok := data["file_path"].(string); ok {
+			// Show a preview of the change
+			oldStr, _ := data["old_string"].(string)
+			newStr, _ := data["new_string"].(string)
+
+			// Truncate for display
+			if len(oldStr) > 50 {
+				oldStr = oldStr[:50] + "..."
+			}
+			if len(newStr) > 50 {
+				newStr = newStr[:50] + "..."
+			}
+
+			// Escape backticks and newlines for inline display
+			oldStr = strings.ReplaceAll(strings.ReplaceAll(oldStr, "`", "'"), "\n", "↵")
+			newStr = strings.ReplaceAll(strings.ReplaceAll(newStr, "`", "'"), "\n", "↵")
+
+			if oldStr != "" && newStr != "" {
+				return fmt.Sprintf("`%s`\n`-%s`\n`+%s`", path, oldStr, newStr)
+			}
 			return fmt.Sprintf("`%s`", path)
 		}
 	case "glob":
@@ -905,8 +979,25 @@ func formatToolInput(toolName string, input json.RawMessage) string {
 // Main streaming function
 // ============================================================================
 
+// ClaudeStreamingOptions contains options for callClaudeStreamingWithOptions
+type ClaudeStreamingOptions struct {
+	ForkFromChannel string // If set, fork session from this channel instead of resuming
+}
+
 // callClaudeStreaming calls Claude with streaming output and posts separate Slack messages
 func callClaudeStreaming(prompt string, channelID string, threadTS string, workDir string, config *Config) (*ClaudeResponse, error) {
+	return callClaudeStreamingWithOptions(prompt, channelID, threadTS, workDir, config, nil)
+}
+
+// callClaudeStreamingForked forks a session from sourceChannel and runs in a new thread
+func callClaudeStreamingForked(prompt string, channelID string, threadTS string, workDir string, config *Config, sourceChannelID string) (*ClaudeResponse, error) {
+	return callClaudeStreamingWithOptions(prompt, channelID, threadTS, workDir, config, &ClaudeStreamingOptions{
+		ForkFromChannel: sourceChannelID,
+	})
+}
+
+// callClaudeStreamingWithOptions is the main implementation with options
+func callClaudeStreamingWithOptions(prompt string, channelID string, threadTS string, workDir string, config *Config, opts *ClaudeStreamingOptions) (*ClaudeResponse, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancel()
 
@@ -922,8 +1013,17 @@ func callClaudeStreaming(prompt string, channelID string, threadTS string, workD
 		"--append-system-prompt", SlackSystemPromptAppend,
 	}
 
-	if sid, ok := claudeSessionIDs.Load(channelID); ok {
-		args = append(args, "--resume", sid.(string))
+	// Handle fork vs normal resume
+	if opts != nil && opts.ForkFromChannel != "" {
+		// Fork: resume from source channel's session but create new session ID
+		if sid, ok := claudeSessionIDs.Load(opts.ForkFromChannel); ok {
+			args = append(args, "--resume", sid.(string), "--fork-session")
+		}
+	} else {
+		// Normal: resume from this channel's session
+		if sid, ok := claudeSessionIDs.Load(channelID); ok {
+			args = append(args, "--resume", sid.(string))
+		}
 	}
 
 	cmd := exec.CommandContext(ctx, claudePath, args...)
@@ -937,6 +1037,10 @@ func callClaudeStreaming(prompt string, channelID string, threadTS string, workD
 	if err := cmd.Start(); err != nil {
 		return nil, fmt.Errorf("failed to start claude: %w", err)
 	}
+
+	// Store process for !cancel
+	activeProcesses.Store(channelID, cmd)
+	defer activeProcesses.Delete(channelID)
 
 	// Create thread manager for separate messages
 	manager := NewSlackThreadManager(config, channelID, threadTS)
@@ -1010,7 +1114,13 @@ func callClaudeStreaming(prompt string, channelID string, threadTS string, workD
 				finalResponse.Usage.CacheReadInputTokens = event.Usage.CacheReadInputTokens
 			}
 			if event.Error != "" {
-				manager.PostError(event.Error)
+				// Check if context is too long - trigger auto-compact
+				if strings.Contains(event.Error, "Prompt is too long") || strings.Contains(event.Error, "too long") {
+					manager.PostAutoCompactNotice()
+					finalResponse.NeedsCompact = true
+				} else {
+					manager.PostError(event.Error)
+				}
 			}
 			// Try to extract result string
 			if len(event.Result) > 0 {

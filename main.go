@@ -80,14 +80,21 @@ func getHelpText() string {
 		"• `!sessions` - List active sessions\n" +
 		"• `!projects` - List projects in projects folder\n\n" +
 		":computer: *Utilities*\n" +
-		"• `!c <cmd>` - Execute shell command\n\n" +
+		"• `!c <cmd>` - Execute shell command\n" +
+		"• `!cancel` - Cancel running task\n" +
+		"• `!verbose` / `!quiet` - Toggle output verbosity\n\n" +
+		":alarm_clock: *Scheduled Tasks*\n" +
+		"• `!at <time> <cmd>` - Schedule a task (e.g., `!at 5m run tests`)\n" +
+		"• `!scheduled` - List scheduled tasks\n" +
+		"• `!unschedule <id>` - Cancel a scheduled task\n\n" +
 		":information_source: *Other*\n" +
 		"• `!ping` - Check if bot is alive\n" +
 		"• `!version` - Show version\n" +
 		"• `!help` - Show this help\n\n" +
 		":speech_balloon: *In a session channel:*\n" +
 		"• Type messages → Claude responds in channel\n" +
-		"• `!task <prompt>` - Start a task in a dedicated thread\n" +
+		"• `!task <prompt>` - Start a fresh task in a thread\n" +
+		"• `!fork <prompt>` - Fork session into a thread (keeps context)\n" +
 		"• `!claude_compact` - Summarize conversation (reduce tokens)\n" +
 		"• `!claude_clear` - Clear session and start fresh\n" +
 		"• `!claude_help` - Show Claude-specific commands"
@@ -165,6 +172,9 @@ func listen(opts listenOpts) error {
 
 	// Initialize message queue for automatic queuing
 	messageQueue = NewChannelQueue()
+
+	// Initialize scheduler for !at commands
+	scheduler = NewScheduler(config)
 
 	// WaitGroup for background goroutines
 	var wg sync.WaitGroup
@@ -312,13 +322,19 @@ func handleSlackEvent(ctx context.Context, cfgMgr *ConfigManager, eventData json
 	}
 	json.Unmarshal(eventData, &event)
 
+	// Debug: log raw event when files are present
+	if len(event.Files) > 0 {
+		logf("DEBUG: Event with files: %s", string(eventData))
+	}
+
 	// Ignore bot messages
 	if event.BotID != "" {
 		return
 	}
 
 	// Ignore system messages (joins, leaves, topic changes, etc.)
-	if event.Subtype != "" {
+	// But allow file_share subtype (when user uploads a file with a message)
+	if event.Subtype != "" && event.Subtype != "file_share" {
 		return
 	}
 
@@ -434,6 +450,58 @@ func handleSlackEvent(ctx context.Context, cfgMgr *ConfigManager, eventData json
 		return
 	}
 
+	// !fork <prompt> - fork current session into a new thread
+	if strings.HasPrefix(text, "!fork ") {
+		// Only works from channel, not from thread
+		if threadTS != "" {
+			reply(":x: `!fork` only works from the main channel, not from a thread")
+			return
+		}
+
+		forkPrompt := strings.TrimSpace(strings.TrimPrefix(text, "!fork "))
+		if forkPrompt == "" {
+			reply("Usage: `!fork <prompt>` - fork session into a new thread")
+			return
+		}
+
+		// Check if we're in a session channel
+		sessionName := cfgMgr.GetSessionByChannel(channelID)
+		if sessionName == "" {
+			reply(":x: Not in a session channel. Use `!fork` in a session channel.")
+			return
+		}
+
+		// Check if there's an active session to fork from
+		if _, ok := getClaudeSessionID(channelID); !ok {
+			reply(":x: No active session to fork. Start a conversation first.")
+			return
+		}
+
+		baseDir := getProjectsDir(config)
+		workDir := filepath.Join(baseDir, sessionName)
+
+		addReaction(config, channelID, event.TS, "twisted_rightwards_arrows")
+		prompt := slackUserPrefix + forkPrompt
+
+		workerPool.Submit(func() {
+			sendMessageToThread(config, channelID, event.TS, ":twisted_rightwards_arrows: *Forked session* - continuing with full context in this thread")
+
+			resp, err := callClaudeStreamingForked(prompt, channelID, event.TS, workDir, config, channelID)
+			if err != nil {
+				logf("Claude fork error: %v", err)
+				addReaction(config, channelID, event.TS, "x")
+				removeReaction(config, channelID, event.TS, "twisted_rightwards_arrows")
+				sendMessageToThread(config, channelID, event.TS, fmt.Sprintf(":x: Fork error: %v", err))
+				return
+			}
+			removeReaction(config, channelID, event.TS, "twisted_rightwards_arrows")
+			addReaction(config, channelID, event.TS, "white_check_mark")
+			logf("Forked session completed (new session: %s, tokens: %d in / %d out)",
+				resp.SessionID, resp.Usage.InputTokens, resp.Usage.OutputTokens)
+		})
+		return
+	}
+
 	if strings.HasPrefix(text, "!sessions") || strings.HasPrefix(text, "!list") {
 		sessions := cfgMgr.GetAllSessions()
 		if len(sessions) == 0 {
@@ -481,6 +549,84 @@ func handleSlackEvent(ctx context.Context, cfgMgr *ConfigManager, eventData json
 			} else {
 				reply(":wastebasket: Channel archived")
 			}
+		}
+		return
+	}
+
+	if text == "!cancel" {
+		if CancelClaudeProcess(channelID) {
+			reply(":stop_sign: Task cancelled")
+		} else {
+			reply(":shrug: No task running in this channel")
+		}
+		return
+	}
+
+	if text == "!verbose" {
+		SetVerbose(channelID, true)
+		reply(":loud_sound: Verbose mode ON - showing all tool calls")
+		return
+	}
+
+	if text == "!quiet" {
+		SetVerbose(channelID, false)
+		reply(":mute: Quiet mode ON - only showing writes and errors")
+		return
+	}
+
+	// !at <time> <command> - schedule a task
+	if strings.HasPrefix(text, "!at ") {
+		parts := strings.SplitN(strings.TrimPrefix(text, "!at "), " ", 2)
+		if len(parts) < 2 {
+			reply("Usage: `!at <time> <command>`\nExamples:\n• `!at 5m run tests`\n• `!at 9am deploy to prod`\n• `!at tomorrow 10am npm run build`")
+			return
+		}
+		timeSpec := parts[0]
+		command := parts[1]
+
+		// Get work directory for this channel
+		sessionName := cfgMgr.GetSessionByChannel(channelID)
+		if sessionName == "" {
+			reply(":x: Not in a session channel. Use `!at` in a session channel.")
+			return
+		}
+		baseDir := getProjectsDir(config)
+		workDir := filepath.Join(baseDir, sessionName)
+
+		taskID, runAt, err := scheduler.Schedule(channelID, threadTS, workDir, timeSpec, command)
+		if err != nil {
+			reply(fmt.Sprintf(":x: Invalid time: %v", err))
+			return
+		}
+
+		reply(fmt.Sprintf(":alarm_clock: Scheduled `%s` for *%s* (task: `%s`)",
+			command, runAt.Format("Mon Jan 2 15:04"), taskID))
+		return
+	}
+
+	// !scheduled - list scheduled tasks
+	if text == "!scheduled" {
+		tasks := scheduler.List(channelID)
+		if len(tasks) == 0 {
+			reply(":calendar: No scheduled tasks for this channel")
+			return
+		}
+		var lines []string
+		for _, t := range tasks {
+			lines = append(lines, fmt.Sprintf("• `%s` at *%s*: `%s`",
+				t.ID, t.RunAt.Format("Mon 15:04"), t.Command))
+		}
+		reply(":calendar: *Scheduled tasks:*\n" + strings.Join(lines, "\n"))
+		return
+	}
+
+	// !unschedule <task-id> - cancel a scheduled task
+	if strings.HasPrefix(text, "!unschedule ") {
+		taskID := strings.TrimPrefix(text, "!unschedule ")
+		if scheduler.Cancel(taskID) {
+			reply(fmt.Sprintf(":wastebasket: Cancelled task `%s`", taskID))
+		} else {
+			reply(fmt.Sprintf(":shrug: Task `%s` not found", taskID))
 		}
 		return
 	}
@@ -659,6 +805,7 @@ func handleSlackEvent(ctx context.Context, cfgMgr *ConfigManager, eventData json
 			os.MkdirAll(uploadsDir, 0755)
 
 			for _, file := range event.Files {
+				logf("File attached: name=%s mimetype=%s filetype=%s", file.Name, file.Mimetype, file.Filetype)
 				if isImageFile(file) || isTextFile(file) {
 					logf("Downloading file: %s (%s)", file.Name, file.Mimetype)
 					localPath, err := downloadSlackFileToDir(config, file, uploadsDir)
@@ -669,6 +816,8 @@ func handleSlackEvent(ctx context.Context, cfgMgr *ConfigManager, eventData json
 					}
 					filePaths = append(filePaths, localPath)
 					logf("Saved file to: %s", localPath)
+				} else {
+					logf("Skipping unsupported file type: %s (mimetype=%s, filetype=%s)", file.Name, file.Mimetype, file.Filetype)
 				}
 			}
 		}
@@ -812,6 +961,25 @@ func processClaudeMessage(msg *QueuedMessage, config *Config, reply func(string)
 			addReaction(config, msg.ChannelID, msg.EventTS, "white_check_mark")
 			logf("Claude responded (session: %s, tokens: %d in / %d out)",
 				resp.SessionID, resp.Usage.InputTokens, resp.Usage.OutputTokens)
+
+			// Auto-compact if context was too long, then continue
+			if resp.NeedsCompact {
+				logf("Auto-compacting session for channel %s", msg.ChannelID)
+				compactResp, compactErr := callClaudeStreaming("/compact", msg.ChannelID, msg.ThreadTS, msg.WorkDir, config)
+				if compactErr != nil {
+					reply(fmt.Sprintf(":x: Auto-compact failed: %v", compactErr))
+				} else {
+					reply(fmt.Sprintf(":broom: *Auto-compacted!* New context: %d tokens. Continuing...", compactResp.Usage.InputTokens))
+					// Auto-continue after compact
+					continueResp, continueErr := callClaudeStreaming("continue where you left off", msg.ChannelID, msg.ThreadTS, msg.WorkDir, config)
+					if continueErr != nil {
+						reply(fmt.Sprintf(":x: Auto-continue failed: %v", continueErr))
+					} else {
+						logf("Auto-continued after compact (tokens: %d in / %d out)",
+							continueResp.Usage.InputTokens, continueResp.Usage.OutputTokens)
+					}
+				}
+			}
 		}
 
 		// Process next in queue
