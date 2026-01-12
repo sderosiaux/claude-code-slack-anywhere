@@ -723,7 +723,7 @@ func (m *SlackThreadManager) PostError(errMsg string) {
 // getToolEmoji returns an emoji for a tool name
 func getToolEmoji(toolName string) string {
 	switch strings.ToLower(toolName) {
-	case "bash", "execute", "command":
+	case "bash", "execute", "command", "bashoutput":
 		return ":computer:"
 	case "read", "readfile":
 		return ":page_facing_up:"
@@ -762,6 +762,10 @@ func formatToolInput(toolName string, input json.RawMessage) string {
 				cmd = cmd[:200] + "..."
 			}
 			return fmt.Sprintf("```\n%s\n```", cmd)
+		}
+	case "bashoutput":
+		if bashID, ok := data["bash_id"].(string); ok {
+			return fmt.Sprintf("reading output `%s`", bashID)
 		}
 	case "read", "readfile":
 		if path, ok := data["file_path"].(string); ok {
