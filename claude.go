@@ -459,8 +459,15 @@ func (m *SlackThreadManager) PostSystemInit(event *StreamEvent) {
 	}
 	m.systemInitPosted = true
 
-	msg := fmt.Sprintf(":zap: *Claude started*\n• Session: `%s`\n• Model: `%s`\n• CWD: `%s`",
-		event.SessionID, event.Model, event.Cwd)
+	// Delete the "Thinking..." message and replace with system init
+	if m.currentAssistantTS != "" {
+		deleteMessage(m.config, m.channelID, m.currentAssistantTS)
+		m.currentAssistantTS = ""
+	}
+
+	// Compact format on one line
+	msg := fmt.Sprintf(":zap: `%s` · %s · `%s`",
+		event.SessionID[:8], event.Model, event.Cwd)
 	sendMessageToThread(m.config, m.channelID, m.threadTS, msg)
 }
 

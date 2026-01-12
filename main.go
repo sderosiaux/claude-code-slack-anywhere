@@ -24,7 +24,12 @@ const version = "2.0.0"
 var buildTime = "dev"
 
 // User prompt prefix - context for each message
-const slackUserPrefix = "[REMOTE via Slack - I cannot see your screen or open files locally. Please show relevant output/content in your responses.] "
+// NOTE: Critical rules are duplicated here because --append-system-prompt may not be respected on resumed sessions
+const slackUserPrefix = `[REMOTE via Slack - I cannot see your screen or open files locally. Please show relevant output/content in your responses.]
+
+BEFORE running any server/daemon command, YOU MUST use pm2 or screen. NEVER run npm run dev, npm start, node server.js directly - use: pm2 start "npm run dev" --name app
+
+`
 
 // System prompt additions via --append-system-prompt
 const SlackSystemPromptAppend = `
@@ -41,6 +46,17 @@ CRITICAL - Process execution rules:
 3. Background processes with & or nohup will be KILLED when session ends
 
 4. To check if a server is running: pm2 list, screen -ls, or curl the endpoint
+
+FORBIDDEN COMMANDS (these will block or die immediately):
+- npm run dev, npm start, npm run serve
+- node server.js, python app.py, go run main.go
+- Any command with & at the end (background processes die on exit)
+- tail -f, watch, nodemon, webpack --watch
+
+USE INSTEAD:
+- pm2 start "npm run dev" --name myapp
+- screen -dmS myapp npm run dev
+- tmux new-session -d -s myapp 'npm run dev'
 `
 
 // Global config manager, worker pool and message queue
