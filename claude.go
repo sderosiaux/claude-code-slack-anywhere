@@ -347,6 +347,9 @@ type SlackThreadManager struct {
 	heartbeatTS      string // Message TS for the heartbeat message
 	lastActivityTime time.Time
 
+	// Track if any assistant text was posted (to avoid double-posting from result)
+	assistantTextPosted bool
+
 	mu sync.Mutex
 }
 
@@ -506,6 +509,7 @@ func (m *SlackThreadManager) flushAssistantText(final bool) {
 	}
 
 	m.lastAssistantUpdate = time.Now()
+	m.assistantTextPosted = true
 }
 
 // FinalizeAssistantText finalizes the current assistant message
@@ -686,6 +690,13 @@ func (m *SlackThreadManager) PostFinalResult(resp *ClaudeResponse) {
 	// Finalize any pending assistant text first
 	if m.currentAssistantContent.Len() > 0 {
 		m.flushAssistantText(true)
+	}
+
+	// If we have a result string and haven't posted any assistant text, post it now
+	// This handles cases where Claude returns text directly in the result without streaming
+	if resp.Result != "" && !m.assistantTextPosted {
+		text := convertBold(resp.Result)
+		sendMessageToThread(m.config, m.channelID, m.threadTS, text)
 	}
 
 	// Check if context is getting large (warn at 150k tokens, typical limit is ~200k)
