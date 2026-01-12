@@ -4,7 +4,7 @@
 
 **[Website](https://sderosiaux.github.io/claudeslack)** · **[GitHub](https://github.com/sderosiaux/claudeslack)**
 
-![claudeslack Interface](docs/slack-interface.png)
+![claudeslack Interface](docs/hero-illustration.png)
 
 ```mermaid
 flowchart LR
