@@ -71,6 +71,52 @@ func logf(format string, args ...interface{}) {
 	fmt.Printf("[%s] %s\n", ts, fmt.Sprintf(format, args...))
 }
 
+// toSlackChannelName converts a folder name to a valid Slack channel name
+// Slack channel names: lowercase, no spaces, no dots, max 80 chars
+func toSlackChannelName(name string) string {
+	result := strings.ToLower(name)
+	result = strings.ReplaceAll(result, ".", "-")
+	result = strings.ReplaceAll(result, " ", "-")
+	result = strings.ReplaceAll(result, "_", "-")
+	// Remove consecutive dashes
+	for strings.Contains(result, "--") {
+		result = strings.ReplaceAll(result, "--", "-")
+	}
+	// Trim dashes from start/end
+	result = strings.Trim(result, "-")
+	// Max 80 chars
+	if len(result) > 80 {
+		result = result[:80]
+	}
+	return result
+}
+
+// fromSlackChannelName attempts to find a matching folder name from a Slack channel name
+// Tries multiple variations: as-is, with dots instead of dashes, with spaces
+func fromSlackChannelName(channelName string, baseDir string) string {
+	// Try exact match first
+	if _, err := os.Stat(filepath.Join(baseDir, channelName)); err == nil {
+		return channelName
+	}
+	// Try with dots instead of dashes (e.g., "conduktor-txt" -> "conduktor.txt")
+	withDots := strings.ReplaceAll(channelName, "-", ".")
+	if _, err := os.Stat(filepath.Join(baseDir, withDots)); err == nil {
+		return withDots
+	}
+	// Try with spaces instead of dashes
+	withSpaces := strings.ReplaceAll(channelName, "-", " ")
+	if _, err := os.Stat(filepath.Join(baseDir, withSpaces)); err == nil {
+		return withSpaces
+	}
+	// Try with underscores
+	withUnderscores := strings.ReplaceAll(channelName, "-", "_")
+	if _, err := os.Stat(filepath.Join(baseDir, withUnderscores)); err == nil {
+		return withUnderscores
+	}
+	// Return original if no match
+	return channelName
+}
+
 func getHelpText() string {
 	return "*claudeslack - Commands*\n\n" +
 		":rocket: *Session Management*\n" +
@@ -404,19 +450,13 @@ func handleSlackEvent(ctx context.Context, cfgMgr *ConfigManager, eventData json
 			channelName, err := getChannelName(config, channelID)
 			if err == nil && channelName != "" {
 				baseDir := getProjectsDir(config)
-				projectDir := filepath.Join(baseDir, channelName)
-				if _, err := os.Stat(projectDir); os.IsNotExist(err) {
-					altName := strings.ReplaceAll(channelName, "-", " ")
-					altDir := filepath.Join(baseDir, altName)
-					if _, err := os.Stat(altDir); err == nil {
-						projectDir = altDir
-						sessionName = altName
-					}
-				} else {
-					sessionName = channelName
-				}
-				if sessionName != "" {
+				// Try to find matching folder (handles dots, spaces, underscores)
+				sessionName = fromSlackChannelName(channelName, baseDir)
+				projectDir := filepath.Join(baseDir, sessionName)
+				if _, err := os.Stat(projectDir); err == nil {
 					cfgMgr.SetSession(sessionName, channelID)
+				} else {
+					sessionName = "" // Reset if folder doesn't exist
 				}
 			}
 		}
@@ -672,19 +712,25 @@ func handleSlackEvent(ctx context.Context, cfgMgr *ConfigManager, eventData json
 			return
 		}
 
+		// Session name = folder name (can have dots, spaces, etc.)
+		sessionName := arg
+		// Channel name = Slack-friendly version (replace dots with dashes, etc.)
+		slackChannelName := toSlackChannelName(arg)
+
 		// Create channel if needed
 		var targetChannelID string
 		isNewChannel := false
-		if cid, exists := cfgMgr.GetSession(arg); exists {
+		if cid, exists := cfgMgr.GetSession(sessionName); exists {
 			targetChannelID = cid
 		} else {
-			cid, err := createChannel(config, arg)
+			cid, err := createChannel(config, slackChannelName)
 			if err != nil {
 				sendMessage(config, channelID, fmt.Sprintf(":x: Failed to create channel: %v", err))
 				return
 			}
 			targetChannelID = cid
-			if err := cfgMgr.SetSession(arg, cid); err != nil {
+			// Store session with original name (folder name), not Slack name
+			if err := cfgMgr.SetSession(sessionName, cid); err != nil {
 				logf("Failed to save session: %v", err)
 			}
 			isNewChannel = true
@@ -692,14 +738,14 @@ func handleSlackEvent(ctx context.Context, cfgMgr *ConfigManager, eventData json
 
 		// Send immediate feedback with channel link
 		if isNewChannel {
-			sendMessage(config, channelID, fmt.Sprintf(":sparkles: Created <#%s> for `%s`", targetChannelID, arg))
+			sendMessage(config, channelID, fmt.Sprintf(":sparkles: Created <#%s> for `%s`", targetChannelID, sessionName))
 		} else {
 			sendMessage(config, channelID, fmt.Sprintf(":arrow_right: Using existing <#%s>", targetChannelID))
 		}
 
-		// Find or create work directory
+		// Find or create work directory (use original name with dots etc.)
 		baseDir := getProjectsDir(config)
-		workDir := filepath.Join(baseDir, arg)
+		workDir := filepath.Join(baseDir, sessionName)
 		if _, err := os.Stat(workDir); os.IsNotExist(err) {
 			if err := os.MkdirAll(workDir, 0755); err != nil {
 				sendMessage(config, targetChannelID, fmt.Sprintf(":x: Failed to create directory %s: %v", workDir, err))
@@ -710,8 +756,8 @@ func handleSlackEvent(ctx context.Context, cfgMgr *ConfigManager, eventData json
 			sendMessage(config, targetChannelID, fmt.Sprintf(":open_file_folder: Using existing `%s`", workDir))
 		}
 
-		logf("Session created: %s (dir: %s)", arg, workDir)
-		sendMessage(config, targetChannelID, fmt.Sprintf(":rocket: Session '%s' ready!\n\nSend messages here to interact with Claude.", arg))
+		logf("Session created: %s (dir: %s)", sessionName, workDir)
+		sendMessage(config, targetChannelID, fmt.Sprintf(":rocket: Session '%s' ready!\n\nSend messages here to interact with Claude.", sessionName))
 
 		// Auto-pin GitHub repo if exists
 		go PinGitHubRepoIfExists(config, targetChannelID, workDir)
@@ -875,19 +921,9 @@ func handleSlackEvent(ctx context.Context, cfgMgr *ConfigManager, eventData json
 	if err == nil && channelName != "" {
 		baseDir := getProjectsDir(config)
 
-		// Try exact match first, then with spaces instead of hyphens
-		projectDir := filepath.Join(baseDir, channelName)
-		sessionName := channelName
-
-		if _, err := os.Stat(projectDir); os.IsNotExist(err) {
-			// Try with spaces instead of hyphens (Slack converts spaces to hyphens)
-			altName := strings.ReplaceAll(channelName, "-", " ")
-			altDir := filepath.Join(baseDir, altName)
-			if _, err := os.Stat(altDir); err == nil {
-				projectDir = altDir
-				sessionName = altName
-			}
-		}
+		// Try to find matching folder (handles dots, spaces, underscores)
+		sessionName := fromSlackChannelName(channelName, baseDir)
+		projectDir := filepath.Join(baseDir, sessionName)
 
 		// Check if project directory exists
 		if _, err := os.Stat(projectDir); err == nil {
