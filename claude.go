@@ -196,7 +196,8 @@ func init() {
 
 	home, _ := os.UserHomeDir()
 	claudePaths := []string{
-		filepath.Join(home, ".claude", "local", "claude"),
+		filepath.Join(home, ".local", "bin", "claude"),
+		filepath.Join(home, ".claude", "local", "claude"), // legacy
 		"/usr/local/bin/claude",
 	}
 
